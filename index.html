@@ -9,7 +9,7 @@
   <link rel="icon" href="icon.png">
   <link rel="apple-touch-icon" href="icon.png">
   <link rel="manifest" href="manifest.webmanifest">
-  <link rel="stylesheet" href="screen.css">
+  <link rel="stylesheet" href="screen.css?v=2">
   <title>跟着说 · 自拍提词</title>
 </head>
 <body>
@@ -61,10 +61,13 @@
       </div>
       <div class="record-row">
         <button id="smaller" class="glass font-button" aria-label="缩小字号">A−</button>
-        <button id="record" class="record" type="button" aria-label="开始录制"><span></span></button>
+        <button id="record" class="record" type="button" aria-label="开始录制">
+          <span class="record-ring" aria-hidden="true"><span class="record-dot"></span></span>
+          <span id="recordText" class="record-text">开始录制</span>
+        </button>
         <button id="larger" class="glass font-button" aria-label="增大字号">A＋</button>
       </div>
-      <div id="recordText" class="record-text">开始录制</div>
+      <p id="recordNotice" class="camera-note" role="status"></p>
     </footer>
   </section>
 
@@ -78,6 +81,6 @@
     </div>
   </section>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=2"></script>
 </body>
 </html>

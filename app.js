@@ -1,5 +1,5 @@
 import { normalize, parseScript } from "./follower.js";
-import { hasRecent, hasUnsaved, loadRecent, makeRecorder, markSaved } from "./recorder.js";
+import { hasRecent, hasUnsaved, loadRecent, startRecorder, markSaved } from "./recorder.js?v=2";
 
 const elements = Object.fromEntries(Array.from(document.querySelectorAll("[id]"),node => [node.id,node]));
 const {
@@ -9,6 +9,7 @@ const {
   first, earlier, later, followToggle, smaller, larger, record, recordText,
   resultVideo, resultNotice, downloadVideo, shareVideo, doneReview
 } = elements;
+const recordNotice = elements.recordNotice || cameraNote;
 
 const scriptKey = "genzheshuo-script";
 const configKey = "genzheshuo-reader";
@@ -58,12 +59,11 @@ function setMode(value,status) {
 }
 
 function renderRecord() {
-  record.disabled = !stream || captureMode === "preparing" || captureMode === "saving" ||
-    (captureMode === "idle" && mode === "loading");
   const saving = captureMode === "saving";
   const recording = captureMode === "recording";
-  const caption = saving ? "正在保存…" : captureMode === "preparing" ? "准备录制…" :
-    recording ? "结束录制" : "开始录制";
+  record.disabled = !stream || saving;
+  const caption = saving ? "正在保存…" : recording ? "结束录制" :
+    stream ? "开始录制" : "正在打开相机…";
   record.classList.toggle("on",recording || saving);
   record.setAttribute("aria-label",caption);
   recordText.textContent = caption;
@@ -240,6 +240,7 @@ async function showCamera(event) {
   const token = ++scene;
   screen(cameraScreen);
   cameraNote.textContent = "";
+  recordNotice.textContent = "";
   setMode("loading","正在打开相机…");
   updatePosition(config.index,0,true);
   setFont(0);
@@ -258,6 +259,7 @@ async function showCamera(event) {
       return;
     }
     stream = captureStream;
+    renderRecord();
     cameraVideo.srcObject = stream;
     cameraVideo.play().catch(() => {});
     navigator.wakeLock?.request("screen").then(lock => {
@@ -296,6 +298,13 @@ function showClip(item) {
 function handleStop(result) {
   captureMode = "idle";
   capture = undefined;
+  clearInterval(clock);
+  counter.hidden = true;
+  if (!result.file && stream?.getTracks().every(track => track.readyState === "live")) {
+    recordNotice.textContent = result.error || "录制未能完成，请再试一次。";
+    renderRecord();
+    return;
+  }
   dropCamera();
   if (result.file) showClip(result);
   else { screen(editorScreen); setNotice(result.error || "录制未能完成"); }
@@ -308,24 +317,16 @@ function finishRecording() {
   capture?.stop();
 }
 
-async function onRecord() {
+function onRecord() {
   if (captureMode === "recording") { finishRecording(); return; }
-  if (!stream || captureMode !== "idle" || mode === "loading") return;
-  if (hasUnsaved() && !window.confirm("上一段视频还在这里。开始新的录制前，你可以返回保存上一段。确定开始新录制吗？")) return;
-  const token = scene;
-  captureMode = "preparing";
-  renderRecord();
-  let prepared;
+  if (!stream || captureMode !== "idle") return;
+  recordNotice.textContent = "";
+  if (hasUnsaved() && !window.confirm("上一段视频还在这里。开始新的录制前，你可以返回保存上一段。确定开始新录制吗？")) {
+    recordNotice.textContent = "已取消新录制，可返回话术页查看上一段视频。";
+    return;
+  }
   try {
-    prepared = await makeRecorder(stream,handleStop);
-    if (scene !== token || !stream?.active) {
-      await prepared.discardUnused();
-      if (scene === token) cameraFailure(new Error("Camera closed"));
-      captureMode = "idle";
-      return;
-    }
-    prepared.start();
-    capture = prepared;
+    capture = startRecorder(stream,handleStop);
     captureMode = "recording";
     counter.hidden = false;
     const start = performance.now();
@@ -337,9 +338,7 @@ async function onRecord() {
     tick();
     clock = setInterval(tick,250);
   } catch {
-    await prepared?.discardUnused();
-    captureMode = "idle";
-    cameraNote.textContent = "未能开始录制，请重新打开相机。";
+    recordNotice.textContent = "未能开始录制。请返回话术，重新打开相机后再试。";
   }
   renderRecord();
 }
@@ -429,5 +428,5 @@ lastVideo.hidden = !hasRecent();
 renderRecord();
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("./offline.js").catch(() => {});
+  navigator.serviceWorker.register("./offline.js",{updateViaCache:"none"}).catch(() => {});
 }

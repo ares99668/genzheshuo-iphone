@@ -35,28 +35,58 @@ export function hasUnsaved() {
 function storageConnection() {
   const worker = new Worker(new URL("./storage-worker.js", import.meta.url));
   let serial = 0;
+  let failure;
   const requests = new Map();
-  worker.onmessage = ({data}) => {
-    const request = requests.get(data.id);
-    requests.delete(data.id);
+
+  function complete(id,error) {
+    const request = requests.get(id);
     if (!request) return;
-    if (data.ok) request.resolve();
-    else request.reject(new Error(data.message));
-  };
+    requests.delete(id);
+    clearTimeout(request.timer);
+    if (error) request.reject(error);
+    else request.resolve();
+  }
+
+  worker.onmessage = ({data}) => complete(data.id,data.ok ? null : new Error(data.message));
   worker.onerror = () => {
-    for (const request of requests.values()) request.reject(new Error("本机存储暂不可用"));
-    requests.clear();
+    failure = new Error("本机存储暂不可用");
+    for (const id of requests.keys()) complete(id,failure);
   };
+
   return {
-    write(type, fields = {}) {
+    write(type,fields = {},timeout = 8000) {
+      if (failure) return Promise.reject(failure);
       return new Promise((resolve,reject) => {
         const id = ++serial;
-        requests.set(id,{resolve,reject});
-        worker.postMessage({id,type,...fields});
+        const timer = setTimeout(() => complete(id,new Error("本机存储没有响应")),timeout);
+        requests.set(id,{resolve,reject,timer});
+        try { worker.postMessage({id,type,...fields}); }
+        catch (error) { complete(id,error); }
       });
     },
     close() { worker.terminate(); }
   };
+}
+
+async function removeRecording(path) {
+  try {
+    const folder = await navigator.storage.getDirectory();
+    await folder.removeEntry(path);
+  } catch { /* the browser can discard temporary storage later */ }
+}
+
+async function prepareStorage(path) {
+  if (!navigator.storage?.getDirectory) return null;
+  let storage;
+  try {
+    storage = storageConnection();
+    await storage.write("open",{name:path},2500);
+    return storage;
+  } catch {
+    storage?.close();
+    void removeRecording(path);
+    return null;
+  }
 }
 
 function filename(ext) {
@@ -66,29 +96,31 @@ function filename(ext) {
   return "跟着说-" + stamp + "." + ext;
 }
 
-export async function makeRecorder(stream, onStop) {
+function startNativeRecorder(stream,options) {
+  const recorder = new MediaRecorder(stream,options);
+  recorder.start(3000);
+  if (recorder.state !== "recording") throw new Error("录制未能启动");
+  return recorder;
+}
+
+export function startRecorder(stream,onStop) {
   const formats = ["video/mp4", "video/webm;codecs=vp8,opus", "video/webm"];
-  const preferred = formats.find(format => MediaRecorder.isTypeSupported(format));
+  const preferred = formats.find(format => MediaRecorder.isTypeSupported?.(format));
   const settings = { videoBitsPerSecond:3_000_000, audioBitsPerSecond:128_000 };
   if (preferred) settings.mimeType = preferred;
-  const recorder = new MediaRecorder(stream,settings);
-  const folder = await navigator.storage?.getDirectory?.().catch(() => null);
-  const path = "selfie-" + (crypto.randomUUID?.() || Date.now()) + ".bin";
-  let storage = folder ? storageConnection() : null;
-  let fatal;
-  let warning;
-  if (storage) {
-    try { await storage.write("open",{name:path}); }
-    catch {
-      storage.close();
-      storage = null;
-      await folder.removeEntry(path).catch(() => {});
-    }
-  }
+  let recorder;
+  try { recorder = startNativeRecorder(stream,settings); }
+  catch { recorder = startNativeRecorder(stream,{}); }
 
+  // Start capture on the click. Local storage can initialize while capture is running.
+  const path = "selfie-" + (crypto.randomUUID?.() || Date.now()) + ".bin";
+  const storageReady = prepareStorage(path);
   const chunks = [];
   let count = 0;
+  let chunkType;
   let writes = Promise.resolve();
+  let fatal;
+  let warning;
   const stop = () => {
     if (recorder.state !== "inactive") recorder.stop();
   };
@@ -96,20 +128,23 @@ export async function makeRecorder(stream, onStop) {
   recorder.addEventListener("dataavailable", ({data}) => {
     if (!data.size) return;
     count += data.size;
-    if (storage) {
-      writes = writes.then(() => {
-        if (!fatal) return storage.write("append",{blob:data});
-      }).catch(() => {
-        fatal = "手机存储不足，视频未能保存";
+    if (!chunkType) chunkType = data.type;
+    writes = writes.then(async () => {
+      if (fatal) return;
+      const storage = await storageReady;
+      if (storage) {
+        await storage.write("append",{blob:data});
+        return;
+      }
+      chunks.push(data);
+      if (count >= MAX_RAM && recorder.state !== "inactive") {
+        warning = "录制已达到本次存储上限，已保留录好的片段。";
         stop();
-      });
-      return;
-    }
-    chunks.push(data);
-    if (count >= MAX_RAM && recorder.state !== "inactive") {
-      warning = "录制已达到本次存储上限，已保留录好的片段。";
+      }
+    }).catch(() => {
+      fatal = "手机存储无法写入，视频未能保存。";
       stop();
-    }
+    });
   });
 
   recorder.addEventListener("error", () => {
@@ -118,42 +153,35 @@ export async function makeRecorder(stream, onStop) {
   });
 
   recorder.addEventListener("stop", async () => {
+    const storage = await storageReady;
+    let result;
     try {
       await writes;
       if (fatal) throw new Error(fatal);
-      if (!count) throw new Error("未录到视频，请再录一段");
-      const type = (recorder.mimeType || preferred || "video/mp4").split(";")[0];
+      if (!count) throw new Error("未录到视频，请再试一次。");
+      const type = (chunkType || recorder.mimeType || "video/mp4").split(";")[0];
       const name = filename(type === "video/mp4" ? "mp4" : "webm");
       let file;
       if (storage) {
         await storage.write("finish");
+        const folder = await navigator.storage.getDirectory();
         const handle = await folder.getFileHandle(path);
         file = new File([await handle.getFile()],name,{type});
         const previous = readRecent();
         try {
           localStorage.setItem(lastKey,JSON.stringify({path,name,type,saved:false}));
-          if (previous?.path && previous.path !== path) await folder.removeEntry(previous.path).catch(() => {});
+          if (previous?.path && previous.path !== path) void removeRecording(previous.path);
         } catch { /* the current preview can still export the file */ }
       } else file = new File(chunks,name,{type});
-      onStop({file, path:storage ? path : null, warning});
+      result = {file, path:storage ? path : null, warning};
     } catch (error) {
-      if (storage) {
-        storage.close();
-        storage = null;
-        await folder.removeEntry(path).catch(() => {});
-      }
-      onStop({error:error.message});
+      if (storage) void removeRecording(path);
+      result = {error:error.message};
     } finally {
       storage?.close();
     }
+    onStop(result);
   },{once:true});
 
-  return {
-    start() { recorder.start(3000); },
-    stop,
-    async discardUnused() {
-      storage?.close();
-      if (storage) await folder.removeEntry(path).catch(() => {});
-    }
-  };
+  return {stop};
 }
