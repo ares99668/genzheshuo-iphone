@@ -1,0 +1,6 @@
+Sherpa-ONNX streaming Zipformer 14M Mandarin, selected int8 files
+https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer.html
+https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
+
+Pinyin lookup data generated from pypinyin 0.55.0
+https://github.com/mozillazg/python-pinyin
